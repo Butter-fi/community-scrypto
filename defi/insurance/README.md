@@ -25,7 +25,7 @@ This will lock free assets in purpose to cover payments for all created policies
 ## Purchase policy
 Purchase specific policy by address, with an insurer address and with XRD
 1. `resim call-method $component purchase $policy1 $acct1 5,$xrd` -> save purchased policy into $purchase1
-This will assign a new vault with the bucket of IPT tokens to the insurer (supply of tokens is equal to the policy coverage) 
+This will assign a new vault with the bucket of IPB for the insurer (supply of badges is equal to the policy coverage) 
 
 ## Approve policy 
 When an insurance case happen, the org can approve policy payment to the insurer.

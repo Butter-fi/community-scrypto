@@ -109,27 +109,26 @@ blueprint! {
             let coverage:Decimal = metadata["coverage"].parse().unwrap();
 
             let ip_resource_def = ResourceBuilder::new()
-                .metadata("name", "Insurance Policy Token")
-                .metadata("symbol", "IPT")
+                .metadata("name", "Insurance Purchase Badge")
+                .metadata("symbol", "IPB")
                 .metadata("expires", expires.to_string())
                 .metadata("policy", policy_address.to_string())
-                .new_token_mutable(self.org_vault.resource_def());
+                .new_badge_mutable(self.org_vault.resource_def());
 
-            let ip_token = self.org_vault.authorize(|badge| {
+            let ip_badge = self.org_vault.authorize(|badge| {
                 ip_resource_def
                     .mint(coverage, badge)
             });
             
-            let vault = Vault::with_bucket(ip_token);
+            let vault = Vault::with_bucket(ip_badge);
 
             // burn taken policy
             self.org_vault.authorize(|badge| {
                 policy.burn(badge);
             });
 
+            // update the vault
             purchases.insert(policy_address, vault);
-            // store the vault
-            // self.purchases.insert(insurer, purchases);
 
             // take payment
             let payment = bucket.take(price);
