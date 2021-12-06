@@ -31,7 +31,7 @@ This will assign a new vault with the bucket of IPT tokens to the insurer (suppl
 When an insurance case happen, the org can approve policy payment to the insurer.
 It could be the entire coverage or a portion
 Purchased policy should not be expired
-1. `resim call-method $component approve $acct1 10`
+1. `resim call-method $component approve $acct1 $policy1 10`
 
 ## Burn expired purchases
 When purchased policy is expired, the org can release locked XRD that weren't approved
