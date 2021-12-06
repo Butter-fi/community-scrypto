@@ -14,8 +14,8 @@ blueprint! {
        
         // HashMap of policy address and details
         policies: HashMap<Address, Vault>,
-        // HashMap of insurer and policy vaults
-        purchases: HashMap<Address, Vault>,
+        // HashMap of insurer and policy vaults HashMap
+        purchases: HashMap<Address, HashMap<Address, Vault>>,
     }
 
     impl Insurance {
@@ -84,7 +84,10 @@ blueprint! {
         pub fn purchase(&mut self, policy_address: Address, insurer: Address, bucket: Bucket) -> Bucket {
             scrypto_assert!(self.policies.contains_key(&policy_address), "No policy found");
             scrypto_assert!(bucket.resource_def() == RADIX_TOKEN.into(), "You must purchase policies with Radix (XRD).");
-            scrypto_assert!(!self.purchases.contains_key(&insurer), "This insurer already has purchases");
+            
+            // here check all vaults of the insurer
+            let purchases = self.purchases.entry(insurer).or_insert(HashMap::new());
+            scrypto_assert!(!purchases.contains_key(&policy_address), "The insurer already has this policy");
 
 
             let policies = self.policies.get(&policy_address).unwrap();
@@ -124,8 +127,9 @@ blueprint! {
                 policy.burn(badge);
             });
 
+            purchases.insert(policy_address, vault);
             // store the vault
-            self.purchases.insert(insurer, vault);
+            // self.purchases.insert(insurer, purchases);
 
             // take payment
             let payment = bucket.take(price);
@@ -136,10 +140,14 @@ blueprint! {
         }
 
         //#[auth(org_badge)]
-        pub fn approve(&mut self, insurer: Address, amount: Decimal){
+        pub fn approve(&mut self, insurer: Address, policy_address: Address, amount: Decimal){
             scrypto_assert!(self.purchases.contains_key(&insurer), "No vault found for this insurer");
 
-            let purchase = self.purchases.get(&insurer).unwrap();
+            let purchases = self.purchases.get(&insurer).unwrap();
+
+            scrypto_assert!(purchases.contains_key(&policy_address), "No such policy found for this insurer");
+
+            let purchase = purchases.get(&policy_address).unwrap();
             let bucket = purchase.take(amount);
 
             // get metadata
@@ -153,15 +161,18 @@ blueprint! {
                 bucket.burn(badge);
             });
         
-
             Account::from(insurer).deposit(self.locked_pool.take(supply));   
         }
 
         //#[auth(org_badge)]
-        pub fn burn_purchases(&mut self, insurer: Address) {
+        pub fn burn_purchases(&mut self, insurer: Address, policy_address: Address) {
             scrypto_assert!(self.purchases.contains_key(&insurer), "No vault found for this insurer");
 
-            let purchase = self.purchases.get(&insurer).unwrap();
+            let purchases = self.purchases.get_mut(&insurer).unwrap();
+            scrypto_assert!(purchases.contains_key(&policy_address), "No such policy found for this insurer");
+
+
+            let purchase = purchases.get(&policy_address).unwrap();
             let bucket = purchase.take_all();
 
             let metadata = bucket.resource_def().metadata();
@@ -178,7 +189,7 @@ blueprint! {
             self.assets_pool.put(self.locked_pool.take(supply));
 
             // clear purchases
-            self.purchases.remove(&insurer);
+            purchases.remove(&policy_address);
         }
 
         //#[auth(org_badge)]
