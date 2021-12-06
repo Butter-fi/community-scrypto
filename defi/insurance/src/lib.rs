@@ -1,33 +1,21 @@
-use sbor::*;
 use scrypto::prelude::*;
-
-#[derive(TypeId, Encode, Decode)]
-struct Policy {
-    duration:u64,
-    amount: Decimal,
-    price: Decimal
-}
-
-#[derive(TypeId, Encode, Decode)]
-struct PurchasedPolicy {
-    epoch: u64,
-    insurer: Address,
-    claimed: Decimal,
-    applied: Decimal
-}
 
 
 blueprint! {
     struct Insurance {
+        /// Mint authorization to TL tokens.
+        org_vault: Vault,
+        org_badge: ResourceDef,
+
         // Non locked assets
         assets_pool: Vault,
         // Locked assets by policies
         locked_pool: Vault,
-        // 
-        company_badge: ResourceDef,
-        // 
-        policies: HashMap<String, Policy>,
-        purchased_policies: HashMap<String, PurchasedPolicy>,
+       
+        // HashMap of policy address and details
+        policies: HashMap<Address, Vault>,
+        // HashMap of insurer and policy vaults
+        purchases: HashMap<Address, Vault>,
     }
 
     impl Insurance {
@@ -36,181 +24,209 @@ blueprint! {
         // This is a function, and can be called directly on the blueprint once deployed
         pub fn new(base_assets: Bucket) -> (Component, Bucket) {
             scrypto_assert!(base_assets.amount() > Decimal::zero(), "Base assets cannot be zero");
+            scrypto_assert!(base_assets.resource_def() == RADIX_TOKEN.into(), "You must use Radix (XRD).");
 
-            let company_badge_bucket = ResourceBuilder::new()
-                 .metadata("name", "Company Badge")
-                 .metadata("symbol", "CB")
-                 .new_badge_fixed(1);
+            let org_bucket = ResourceBuilder::new()
+                .metadata("name", "Org Mint Auth")
+                .new_badge_fixed(2);
 
+            let org_resource_def = org_bucket.resource_def();
+            let org_return_bucket: Bucket = org_bucket.take(1); // Return this badge to the caller
 
             let assets_def = base_assets.resource_def();
             let component = Self {
+                org_vault: Vault::with_bucket(org_bucket),
+                org_badge: org_resource_def,
                 assets_pool: Vault::with_bucket(base_assets),
                 locked_pool: Vault::new(assets_def),
-                company_badge:company_badge_bucket.resource_def(),
                 policies:HashMap::new(),
-                purchased_policies: HashMap::new()
+                purchases: HashMap::new()
             }
             .instantiate();
-            (component,company_badge_bucket)
+            (component,org_return_bucket)
         }
 
-        // #[auth(company_badge)]
+        
+        // #[auth(org_badge)]
+        pub fn make_policy(&mut self, policy_type: String, coverage: Decimal, price:Decimal, duration:u64, supply: Decimal){
+            scrypto_assert!(coverage > Decimal::zero(), "Coverage cannot be zero");
+            scrypto_assert!(price > Decimal::zero(), "Price cannot be zero");
+            scrypto_assert!(duration > 0, "Duration cannot be zero");
+            scrypto_assert!(supply > Decimal::zero(), "Supply cannot be zero");
+
+            scrypto_assert!(self.assets_pool.amount() >= coverage * supply, "You don't have enough assets to cover this supply");
+
+            // policy badge
+            let ip_resource_def = ResourceBuilder::new()
+                 .metadata("name", "Insurance Policy badge")
+                 .metadata("symbol", policy_type)
+                 .metadata("price", price.to_string())
+                 .metadata("coverage", coverage.to_string())
+                 .metadata("duration", duration.to_string())
+                 .new_badge_mutable(self.org_vault.resource_def());
+
+            info!("New policy address: {}", ip_resource_def.address());
+            let bucket = self.org_vault.authorize(|badge| {
+                ip_resource_def
+                    .mint(supply, badge)
+            });
+
+            // new vault
+            let vault = Vault::with_bucket(bucket);
+            self.policies.insert(ip_resource_def.address(), vault);
+
+            // lock assets
+            let locked = self.assets_pool.take(coverage * supply);
+
+            self.locked_pool.put(locked)
+        }
+
+        pub fn purchase(&mut self, policy_address: Address, insurer: Address, bucket: Bucket) -> Bucket {
+            scrypto_assert!(self.policies.contains_key(&policy_address), "No policy found");
+            scrypto_assert!(bucket.resource_def() == RADIX_TOKEN.into(), "You must purchase policies with Radix (XRD).");
+            scrypto_assert!(!self.purchases.contains_key(&insurer), "This insurer already has purchases");
+
+
+            let policies = self.policies.get(&policy_address).unwrap();
+            scrypto_assert!(!policies.is_empty(), "No available policies");
+
+            // take one policy
+            let policy = policies.take(1);
+            // get metadata
+            let metadata = policy.resource_def().metadata();
+            // check price
+            let price:Decimal = metadata["price"].parse().unwrap();
+            scrypto_assert!(bucket.amount() > price, "Not enough amount to purchase this policy");
+
+            // check duration and setup the end epoch
+            let duration:u64 = metadata["duration"].parse().unwrap();
+            let expires = Context::current_epoch() + duration;
+
+            // check coverage
+            let coverage:Decimal = metadata["coverage"].parse().unwrap();
+
+            let ip_resource_def = ResourceBuilder::new()
+                .metadata("name", "Insurance Policy Token")
+                .metadata("symbol", "IPT")
+                .metadata("expires", expires.to_string())
+                .metadata("policy", policy_address.to_string())
+                .new_token_mutable(self.org_vault.resource_def());
+
+            let ip_token = self.org_vault.authorize(|badge| {
+                ip_resource_def
+                    .mint(coverage, badge)
+            });
+            
+            let vault = Vault::with_bucket(ip_token);
+
+            // burn taken policy
+            self.org_vault.authorize(|badge| {
+                policy.burn(badge);
+            });
+
+            // store the vault
+            self.purchases.insert(insurer, vault);
+
+            // take payment
+            let payment = bucket.take(price);
+            self.assets_pool.put(payment);
+
+            // return the rest bucket
+            bucket
+        }
+
+        //#[auth(org_badge)]
+        pub fn approve(&mut self, insurer: Address, amount: Decimal){
+            scrypto_assert!(self.purchases.contains_key(&insurer), "No vault found for this insurer");
+
+            let purchase = self.purchases.get(&insurer).unwrap();
+            let bucket = purchase.take(amount);
+
+            // get metadata
+            let metadata = bucket.resource_def().metadata();
+            let expires:u64 = metadata["expires"].parse().unwrap();
+            scrypto_assert!(Context::current_epoch() < expires, "Policy is expired");
+
+            let supply = bucket.amount();
+            // Burn the TL tokens received
+            self.org_vault.authorize(|badge| {
+                bucket.burn(badge);
+            });
+        
+
+            Account::from(insurer).deposit(self.locked_pool.take(supply));   
+        }
+
+        //#[auth(org_badge)]
+        pub fn burn_purchases(&mut self, insurer: Address) {
+            scrypto_assert!(self.purchases.contains_key(&insurer), "No vault found for this insurer");
+
+            let purchase = self.purchases.get(&insurer).unwrap();
+            let bucket = purchase.take_all();
+
+            let metadata = bucket.resource_def().metadata();
+            let expires:u64 = metadata["expires"].parse().unwrap();
+            scrypto_assert!(Context::current_epoch() > expires, "Policy is not expired");
+
+            let supply = bucket.amount();
+            // Burn the the rest purchases
+            self.org_vault.authorize(|badge| {
+                bucket.burn(badge);
+            });
+
+            // unlock assets
+            self.assets_pool.put(self.locked_pool.take(supply));
+
+            // clear purchases
+            self.purchases.remove(&insurer);
+        }
+
+        //#[auth(org_badge)]
+        pub fn burn_policies(&mut self, policy_address: Address) {
+            scrypto_assert!(self.policies.contains_key(&policy_address), "No policy found");
+
+            let policies = self.policies.get(&policy_address).unwrap();
+            let bucket = policies.take_all();
+
+            let metadata = bucket.resource_def().metadata();
+            let coverage:Decimal = metadata["coverage"].parse().unwrap();
+           
+            let supply = bucket.amount()*coverage;
+            // Burn the the rest purchases
+            self.org_vault.authorize(|badge| {
+                bucket.burn(badge);
+            });
+
+            // unlock assets
+            self.assets_pool.put(self.locked_pool.take(supply));
+
+            // clear policies
+            self.policies.remove(&policy_address);
+        }
+
+        /// Org assets methods
+        // #[auth(org_badge)]
         pub fn deposit(&mut self, bucket: Bucket) {
             scrypto_assert!(bucket.amount() > Decimal::zero(), "You cannot deposit zero amount");
 
             self.assets_pool.put(bucket)
         }
 
-        // #[auth(company_badge)]
+        // #[auth(org_badge)]
         pub fn withdraw(&mut self, amount: Decimal) -> Bucket {
             scrypto_assert!(self.assets_pool.amount() >= amount, "Withdraw amount is bigger than available assets");
 
             self.assets_pool.take(amount)
         }
 
-        // #[auth(company_badge)]
+        // #[auth(org_badge)]
         pub fn assets(&mut self) -> Decimal {
             self.assets_pool.amount()
         }
 
-        // #[auth(company_badge)]
+        // #[auth(org_badge)]
         pub fn locked(&mut self) -> Decimal {
             self.locked_pool.amount()
         }
-
-        // #[auth(company_badge)]
-        pub fn new_policy(&mut self, uuid: String, amount: Decimal, price:Decimal, duration:u64){
-            scrypto_assert!(self.assets_pool.amount() > amount, "You don't have enough assets to cover this policy");
-            
-
-            // new policy
-            let policy = Policy { duration, amount, price };
-            self.policies.insert(uuid, policy);
-
-            // lock assets
-            let locked = self.assets_pool.take(amount);
-
-            self.locked_pool.put(locked)
-        }
-
-        pub fn purchase(&mut self, uuid: String, bucket: Bucket) -> Bucket {
-            scrypto_assert!(self.policies.contains_key(&uuid), "No policy found");
-            scrypto_assert!(!self.purchased_policies.contains_key(&uuid), "This policy is already purchased");
-
-            let policy = self.policies.get(&uuid).unwrap();
-            scrypto_assert!(bucket.amount() > policy.amount, "Not enough amount to purchase this policy");
-
-            let purchased_policy = PurchasedPolicy { 
-                epoch: Context::current_epoch() + policy.duration, 
-                insurer: bucket.resource_address(), 
-                claimed: Decimal::zero(),
-                applied: Decimal::zero()
-            };
-
-            self.purchased_policies.insert(uuid, purchased_policy);
-
-            // take payment
-            let payment = bucket.take(policy.price);
-            self.assets_pool.put(payment);
-
-            bucket
-        }
-
-        pub fn claim(&mut self, uuid: String, insurer: Address, amount: Decimal) {
-            scrypto_assert!(self.purchased_policies.contains_key(&uuid), "This policy is not purchased");
-            let policy = self.policies.get(&uuid).unwrap();
-
-            let purchased = self.purchased_policies.get_mut(&uuid).unwrap();
-            scrypto_assert!(purchased.insurer == insurer, "This policy doesn't belong to this insurer");
-            // we check the epoch only for claims. Once the claim was made, we allow approve and apply even if policy is expired
-            scrypto_assert!(Context::current_epoch() <= purchased.epoch, "This policy is expired");
-            scrypto_assert!(purchased.claimed == Decimal::zero(), "The policy already has claimed amount");
-            scrypto_assert!(amount <= policy.amount-purchased.applied, "Claimed amount is bigger than the policy can allow");
-
-            (*purchased).claimed = amount;
-            // let updated = PurchasedPolicy {
-            //     epoch: purchased.epoch, 
-            //     insurer: purchased.insurer, 
-            //     claimed: amount,
-            //     approved: purchased.approved,
-            //     applied: purchased.applied
-            // };
-
-            // self.purchased_policies.insert(uuid, updated);
-        }
-
-        // #[auth(company_badge)]
-        pub fn approve(&mut self, uuid: String, amount: Decimal) {
-            scrypto_assert!(self.purchased_policies.contains_key(&uuid), "This policy is not purchased");
-
-            let purchased = self.purchased_policies.get_mut(&uuid).unwrap();
-            scrypto_assert!(amount <= purchased.claimed, "Approved amount cannot be bigger than claimed");
-
-            // let updated = PurchasedPolicy {
-            //     epoch: purchased.epoch, 
-            //     insurer: purchased.insurer, 
-            //     claimed: Decimal::zero(), //we reset claimed amount even though it can be bigger than the approved
-            //     approved: amount,
-            //     applied: purchased.applied
-            // };
-
-
-            // self.purchased_policies.insert(uuid, updated);
-            (*purchased).claimed = Decimal::zero();
-            (*purchased).applied += amount;
-
-            let insurer = purchased.insurer;
-            let payment = self.locked_pool.take(amount);
-            let vault = Vault::new(insurer);
-            vault.put(payment);
-        }
-
-        // #[auth(company_badge)]
-        pub fn expire(&mut self, uuid: String) {
-            scrypto_assert!(self.purchased_policies.contains_key(&uuid), "This policy is not purchased");
-
-            let purchased = self.purchased_policies.get(&uuid).unwrap();
-            scrypto_assert!(Context::current_epoch() > purchased.epoch, "Purchased policy is not expired yet");
-
-            let policy = self.policies.get(&uuid).unwrap();
-
-            let locked = self.locked_pool.take(policy.amount - purchased.applied);
-
-            self.assets_pool.put(locked);
-
-            self.purchased_policies.remove_entry(&uuid);
-        }
-
-        // #[auth(company_badge)]
-        pub fn remove(&mut self, uuid: String) {
-            scrypto_assert!(!self.purchased_policies.contains_key(&uuid), "This policy is purchased");
-
-            let policy = self.policies.get(&uuid).unwrap();
-
-            let locked = self.locked_pool.take(policy.amount);
-
-            self.assets_pool.put(locked);
-
-            self.policies.remove_entry(&uuid);
-        }
-
-        // TODO: add this as a feature
-        // pub fn purchased(&mut self, address: Address) {
-        //     // return a list of purchases
-        // }
-
-
-        // TODO: rethink about the policies as possible token instead. check the candy store
-        // pros: using token allows to replace purchased certificate so it will contain the epoch. Insurer can sell the cert as they want
-        // There could be a burn function for the entire token. Policy can hold the Vault, so no need to hold locked amount. After burning the policy can be removed
-        // cons: need to find out how to mark some policy as purchased. This solution will not allow to claim and approve multiple times
-        // in purpose to hold the vault the policy should be in the blueprint
-
-        // or
-
-        // we can actually replace Policy with a token and metadata that we can use for claim and approve. But it can only be as one time payment
-        // by claiming, the token can be added into a burning hash map
-        // once the policy with some amount is approved, the token can be burned
     }
 }
