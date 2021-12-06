@@ -207,6 +207,7 @@ blueprint! {
         /// Org assets methods
         // #[auth(org_badge)]
         pub fn deposit(&mut self, bucket: Bucket) {
+            scrypto_assert!(bucket.resource_def() == RADIX_TOKEN.into(), "You must deposit with Radix (XRD).");
             scrypto_assert!(bucket.amount() > Decimal::zero(), "You cannot deposit zero amount");
 
             self.assets_pool.put(bucket)
